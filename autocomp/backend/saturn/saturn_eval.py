@@ -1,0 +1,1316 @@
+import subprocess
+import pathlib
+import multiprocessing
+import shutil
+import time
+import glob
+import re
+import os
+from typing import List
+
+from autocomp.common import logger, SOLS_DIR
+from autocomp.search.prob import Prob, Test
+from autocomp.backend.eval_backend import EvalBackend
+
+# Environment path variables. Defaults: Chipyard and zephyr-chipyard-sw next to this checkout, as in
+# SALTy-rn's third_party/ (autocomp, chipyard, zephyr).
+_THIRD_PARTY = pathlib.Path(__file__).resolve().parents[4]
+SATURN_CHIPYARD_PATH = os.environ.get("SATURN_CHIPYARD_PATH", str(_THIRD_PARTY / "chipyard"))
+SATURN_ZEPHYR_BASE = os.environ.get("SATURN_ZEPHYR_BASE", str(_THIRD_PARTY / "zephyr"))  # Zephyr installation root
+
+# Spike ISA for the concrete correctness check. Spike's default VLEN is 128; set the VLEN of the FireSim
+# image (e.g. ..._zvl512b) so candidates are checked on the vector length they are optimized for.
+SATURN_SPIKE_ISA = os.environ.get("SATURN_SPIKE_ISA", "rv64gcv_zicntr")
+
+# Timeouts (seconds)
+SATURN_SPIKE_TIMEOUT = 60.0
+SATURN_COMPILE_TIMEOUT = 360.0  # 8 parallel pristine `west build -p` runs (slots 1-7 cold)
+                                 # under disk+CPU contention easily blow past 120s on iter 1;
+                                 # 360s gives headroom. After first iter, slots are warm and
+                                 # incremental builds finish in ~15s regardless.
+SATURN_FIRESIM_PER_CANDIDATE_TIMEOUT = 120.0
+SATURN_FIRESIM_MIN_TIMEOUT = 60.0
+
+FIRESIM_REPEAT_ITERS = 15
+
+SATURN_TEMP_DIR = pathlib.Path(__file__).parent / "tmp_dir"
+SATURN_ZEPHYR_APP_PATH = pathlib.Path(__file__).parent / "rvv_bench" # Default Zephyr app (saturn-rvv prob_type)
+# Where the live uartlog is written. Locally attached FPGAs (e.g. Alveo U250, externally provisioned
+# localhost): this directory on this machine. AWS EC2 F2 run farms: the run host's
+# <default_simulation_dir>/sim_slot_0 from config_runtime.yaml, read over SSH (see _uartlog_reader).
+# SATURN_FIRESIM_SIM_SLOT_DIR overrides the directory in either case.
+SATURN_FIRESIM_SIM_SLOT_DIR = (pathlib.Path(os.environ["SATURN_FIRESIM_SIM_SLOT_DIR"])
+                               if os.environ.get("SATURN_FIRESIM_SIM_SLOT_DIR") else None)
+SATURN_FIRESIM_SSH_KEY = os.environ.get("SATURN_FIRESIM_SSH_KEY", str(pathlib.Path.home() / "firesim.pem"))
+
+
+BUILD_SLOT_MARKER = ".source_app"
+
+
+def _app_path_for(prob_type: str) -> pathlib.Path:
+    """Resolve the Zephyr app directory for a given prob_type.
+
+    Most prob_types share rvv_bench/. KernelBench-derived prob_types use rvv_bench_kb/,
+    which links ExecuTorch+XNNPACK so the harness can call the on-target reference
+    via executorch_invoke().
+    """
+    base = pathlib.Path(__file__).parent
+    if prob_type and prob_type.startswith("kb-rvv"):
+        return base / "rvv_bench_kb"
+    return base / "rvv_bench"
+
+
+def _src_fingerprint(src_app: pathlib.Path) -> str:
+    """Identity of the source app + its per-problem files. Changes whenever
+    the extractor regenerates data.h/params.c/model_pte.c (different prob_id),
+    so the build slot is invalidated even when the source app dir is the same."""
+    import hashlib
+    h = hashlib.sha256()
+    h.update(str(src_app).encode())
+    # Per-problem files written by scripts/extract_kb_problem.py. Hashing
+    # contents catches prob_id swaps within the same prob_type's app dir.
+    for fname in ("src/data.h", "src/params.c", "src/model_pte.c", "src/input.c"):
+        p = src_app / fname
+        if p.exists():
+            h.update(p.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def _prepare_build_slot(app_dir: pathlib.Path, build_dir: pathlib.Path, src_app: pathlib.Path) -> bool:
+    """Ensure app_dir reflects src_app; return True if a fresh copytree happened.
+
+    Invalidates on two distinct kinds of change:
+      1. Source app dir changes (e.g. saturn-rvv → kb-rvv, picks rvv_bench vs rvv_bench_kb).
+      2. Per-problem files in src/ change (data.h, params.c, model_pte.c) — happens when
+         the extractor runs for a different prob_id within the same prob_type.
+    The BUILD_SLOT_MARKER file stores a fingerprint covering both; mismatch forces re-copy.
+    """
+    src_fp = _src_fingerprint(src_app)
+    marker = app_dir / BUILD_SLOT_MARKER
+    try:
+        prior_fp = marker.read_text().strip()
+    except FileNotFoundError:
+        prior_fp = ""
+    is_first = (
+        not (build_dir / "zephyr" / "zephyr.elf").exists()
+        or prior_fp != src_fp
+    )
+    if is_first:
+        if app_dir.exists():
+            shutil.rmtree(app_dir)
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+        shutil.copytree(
+            src_app, app_dir,
+            ignore=shutil.ignore_patterns('build*', '__pycache__', '*.o', '*.elf')
+        )
+        (app_dir / BUILD_SLOT_MARKER).write_text(src_fp)
+    return is_first
+
+# Preamble prepended to reference.c so the sol body compiles standalone.
+# Sols typically have no includes (they're function bodies meant to be embedded).
+_REFERENCE_C_PREAMBLE = """// AUTO-GENERATED by saturn_eval — sol body renamed to `reference_kernel`.
+// Regenerated on every spike/firesim build; do not edit.
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <math.h>
+#include <riscv_vector.h>
+#include "xnnpack/common.h"
+
+// Canonical XNNPACK param struct layouts (sols only read scalar.{min,max}
+// for the minmax variant; default is opaque). Matches xnnpack/microparams.h.
+struct xnn_f32_default_params { char _; };
+struct xnn_f32_minmax_params { struct { float min, max; } scalar; };
+struct xnn_u8_minmax_params  { struct { uint32_t min, max; } scalar; };
+struct xnn_s8_minmax_params  { struct { int32_t  min, max; } scalar; };
+struct xnn_qs8_rsum_params   { char _; };
+struct xnn_qs8_cvt_params    { struct { int16_t input_zero_point; int32_t multiplier; int16_t output_zero_point; } scalar; };
+struct xnn_qs8_lrelu_params  { struct { int32_t input_zero_point; int32_t positive_multiplier; int32_t negative_multiplier; int32_t output_zero_point; } scalar; };
+struct xnn_f32_lrelu_params  { struct { float slope; } scalar; };
+struct xnn_qu8_add_minmax_params {
+    struct {
+        uint8_t a_zero_point;
+        uint8_t b_zero_point;
+        int32_t bias;
+        int32_t a_multiplier;
+        int32_t b_multiplier;
+        int32_t shift;
+        int16_t output_zero_point;
+        uint8_t output_min;
+        uint8_t output_max;
+    } scalar;
+};
+union xnn_qs8_mul_minmax_params {
+    struct {
+        int8_t  a_zero_point;
+        int8_t  b_zero_point;
+        float   scale;
+        int16_t output_zero_point;
+        int8_t  output_min;
+        int8_t  output_max;
+    } scalar;
+};
+struct xnn_qs8_add_minmax_params {
+    struct {
+        int8_t a_zero_point;
+        int8_t b_zero_point;
+        int32_t bias;
+        int32_t a_multiplier;
+        int32_t b_multiplier;
+        int32_t shift;
+        int16_t output_zero_point;
+        int8_t output_min;
+        int8_t output_max;
+    } scalar;
+};
+struct xnn_qs8_f32_cvt_params { struct { int32_t zero_point; float scale; } scalar; };
+struct xnn_qu8_f32_cvt_params { struct { int32_t zero_point; float scale; } scalar; };
+struct xnn_f32_qc4w_minmax_params { struct { float min; float max; int32_t kernel_zero_point; } scalar; };
+struct xnn_qd8_quantization_params { int32_t zero_point; float inv_scale; };
+
+"""
+
+_EMPTY_REFERENCE_C = "// no sol available for this prob; reference.c is empty\n"
+
+
+def _extract_function_name(code_str: str) -> str | None:
+    """Return the name of the first C function definition in `code_str`
+    that is NOT `pack_weights` (the optional companion fn — the kernel is
+    what gets renamed to reference_kernel), or None if no function
+    definition is found. Strips comments first so PyTorch-source comments
+    at the top of a sol don't false-match."""
+    code_str = re.sub(r'/\*.*?\*/', '', code_str, flags=re.DOTALL)
+    code_str = re.sub(r'//[^\n]*', '', code_str)
+    for name, _start, _bo, _bc in _find_function_spans(code_str):
+        if name != 'pack_weights':
+            return name
+    return None
+
+
+def _build_reference_c(prob) -> str:
+    """Materialize the contents of app/src/reference.c for `prob` — its sol's
+    function renamed to `reference_kernel`, with a preamble of includes and
+    canonical param-struct definitions so the file compiles standalone.
+
+    Returns _EMPTY_REFERENCE_C if no sol is found — the harness then must not
+    declare `extern reference_kernel` (older harnesses with inline references
+    are unaffected)."""
+    sol_dir = SOLS_DIR / prob.prob_type
+    sol_files = sorted(sol_dir.glob(f"{prob.prob_id}_*.c"))
+    if not sol_files:
+        return _EMPTY_REFERENCE_C
+    sol_text = sol_files[0].read_text()
+    fn_name = _extract_function_name(sol_text)
+    if not fn_name:
+        return _EMPTY_REFERENCE_C
+    # Rename the first occurrence of the function name (the definition).
+    # Sols don't recurse, so first occurrence == the function name itself.
+    renamed = sol_text.replace(fn_name, "reference_kernel", 1)
+    # Drop a leading `static` so the harness can extern this symbol.
+    renamed = re.sub(
+        r'\bstatic\s+(?=\w[\w\s*]*\breference_kernel\s*\()',
+        '', renamed, count=1,
+    )
+    return _REFERENCE_C_PREAMBLE + _xnn_prelude([renamed], _REFERENCE_C_PREAMBLE + renamed) + renamed
+
+
+_FUNC_DECL_RE = re.compile(
+    r'(?:static\s+|inline\s+|__attribute__\S+\s+)*\w[\w\s*]*\s+(\w+)\s*\([^)]*\)[^{]*\{',
+    re.DOTALL,
+)
+
+
+def _blank_comments(code_str: str) -> str:
+    """Replace C/C++ comments with same-length whitespace so downstream
+    regex/brace scans can't false-match on comment text (e.g. a comment
+    phrase like `layout (described below)` parsing as a function decl),
+    while every offset stays valid in the original string."""
+    def _white(m):
+        return ''.join('\n' if ch == '\n' else ' ' for ch in m.group(0))
+    code_str = re.sub(r'/\*.*?\*/', _white, code_str, flags=re.DOTALL)
+    code_str = re.sub(r'//[^\n]*', _white, code_str)
+    return code_str
+
+
+def _blank_preprocessor(code_str: str) -> str:
+    """Replace preprocessor directive lines (with their backslash continuations)
+    with same-length whitespace, like _blank_comments: a function-like macro
+    (`#define XNN_UNLIKELY(x) (x)`) must not parse as a function declaration."""
+    def _white(m):
+        return ''.join('\n' if ch == '\n' else ' ' for ch in m.group(0))
+    return re.sub(r'^[ \t]*#(?:[^\n]*\\\n)*[^\n]*', _white, code_str, flags=re.M)
+
+
+# XNNPACK's macros and scalar helpers (xnnpack/common.h, xnnpack/math.h) that a translated kernel may use. A
+# candidate's body is injected without the rest of its file, and neither the harness nor reference.c's preamble
+# provides all of them, so _xnn_prelude emits what the code uses and the surrounding file does not define.
+_XNN_MACROS = {
+    "XNN_LIKELY": "#define XNN_LIKELY(x) (__builtin_expect(!!(x), 1))",
+    "XNN_UNLIKELY": "#define XNN_UNLIKELY(x) (__builtin_expect(!!(x), 0))",
+    "XNN_UNPREDICTABLE": "#define XNN_UNPREDICTABLE(x) (x)",
+    "XNN_INLINE": "#define XNN_INLINE inline",
+    "XNN_ALIGN": "#define XNN_ALIGN(x) __attribute__((__aligned__(x)))",
+    "XNN_OOB_READS": "#define XNN_OOB_READS",
+}
+_XNN_HELPERS = {
+    "min": "static inline size_t min(size_t a, size_t b) { return b < a ? b : a; }",
+    "max": "static inline size_t max(size_t a, size_t b) { return b > a ? b : a; }",
+    "doz": "static inline size_t doz(size_t a, size_t b) { return a > b ? a - b : 0; }",
+    "divide_round_up": "static inline size_t divide_round_up(size_t n, size_t q) { return n % q == 0 ? n / q : n / q + 1; }",
+    "round_up_po2": "static inline size_t round_up_po2(size_t n, size_t q) { return (n + q - 1) & -q; }",
+    "round_down_po2": "static inline size_t round_down_po2(size_t n, size_t q) { return n & -q; }",
+    "math_min_s32": "static inline int32_t math_min_s32(int32_t a, int32_t b) { return b < a ? b : a; }",
+    "math_max_s32": "static inline int32_t math_max_s32(int32_t a, int32_t b) { return b > a ? b : a; }",
+    "math_min_u32": "static inline uint32_t math_min_u32(uint32_t a, uint32_t b) { return b < a ? b : a; }",
+    "math_max_u32": "static inline uint32_t math_max_u32(uint32_t a, uint32_t b) { return b > a ? b : a; }",
+}
+
+
+def _xnn_prelude(used: list, context: str) -> str:
+    """The XNNPACK macros and helpers that the code in `used` calls but `context` (the code around it: the
+    harness, or the sol in reference.c) neither defines nor includes. Macros are #ifndef-guarded."""
+    code = _blank_comments("\n".join(u for u in used if u))
+    ctx = _blank_comments(context or "")
+    lines = []
+    for name, define in _XNN_MACROS.items():
+        if re.search(rf"\b{name}\b", code):
+            lines += [f"#ifndef {name}", define, "#endif"]
+    has_math_h = re.search(r'#\s*include\s*[<"]xnnpack/math\.h[>"]', ctx)
+    for name, definition in _XNN_HELPERS.items():
+        if (re.search(rf"\b{name}\s*\(", code) and not has_math_h
+                and not re.search(rf"#\s*define\s+{name}\b|\b{name}\s*\([^;{{)]*\)\s*\{{", ctx)):
+            lines.append(definition)
+    return ("// XNNPACK macros and helpers the code uses (saturn_eval._xnn_prelude)\n" + "\n".join(lines) + "\n"
+            if lines else "")
+
+
+def _find_function_spans(code_str: str):
+    """Yield (name, start_pos, brace_open, brace_close) for each top-level
+    function definition in code_str. Walks brace depth to find the matching
+    closing brace; ignores nested braces. Skips when no '{' opens.
+
+    Scans a copy with comments and preprocessor lines blanked (offsets identical
+    to the original) so comment text or a function-like macro can never look
+    like a declaration or unbalance the brace walk; the yielded offsets are
+    valid for slicing the original string."""
+    scan = _blank_preprocessor(_blank_comments(code_str))
+    pos = 0
+    while pos < len(scan):
+        m = _FUNC_DECL_RE.search(scan, pos)
+        if not m:
+            return
+        name = m.group(1)
+        brace_open = m.end() - 1
+        depth = 1
+        i = brace_open + 1
+        while i < len(scan):
+            ch = scan[i]
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    yield (name, m.start(), brace_open, i)
+                    pos = i + 1
+                    break
+            i += 1
+        else:
+            return
+
+
+def clean_code(code_str: str) -> str:
+    """
+    Takes LLM-generated code, removes any outer function wrapper, and returns
+    just the function body.
+
+    Handles any function name (void test, void xnn_f32_..., static void ..., etc).
+    If no function wrapper is found, returns as-is.
+
+    Skips `pack_weights` — that's an OPTIONAL companion function the harness
+    treats separately (see _extract_pack_weights); the body returned here is
+    always the kernel proper (typically `test_rvv`).
+    """
+    if not code_str:
+        return ""
+
+    for name, _start, brace_open, brace_close in _find_function_spans(code_str):
+        if name == 'pack_weights':
+            continue
+        return code_str[brace_open + 1:brace_close]
+
+    return code_str
+
+
+def _extract_pack_weights(code_str: str) -> str | None:
+    """If code_str defines a `pack_weights` function, return its full definition
+    as a string (header + body). Returns None if not present.
+
+    The returned string is suitable for direct emission into main.c after a
+    rename pass — inject_candidates rewrites the name to `_cand_<i>_pack_weights`
+    so multiple candidates do not collide.
+    """
+    if not code_str:
+        return None
+    for name, start, _bo, brace_close in _find_function_spans(code_str):
+        if name == 'pack_weights':
+            return code_str[start:brace_close + 1]
+    return None
+
+
+class SaturnTest(Test):
+    def uses_candidate_fn_style(self) -> bool:
+        """True if harness defines `candidate_fn_t` (xnnpack-style candidate array),
+        False for legacy inline-SUBSTITUTE-HERE harnesses."""
+        try:
+            return "candidate_fn_t" in pathlib.Path(self.test_file).read_text()
+        except Exception:
+            return False
+
+    def inject_candidates(self, code_bodies: list[str], candidate_ids: list[int],
+                          param_sig: str, pack_defs: list = None) -> str:
+        """
+        Inject candidate functions + candidate_fns[]/candidate_ids[]/NUM_CANDIDATES
+        between SUBSTITUTE HERE / SUBSTITUTE END markers (file scope).
+
+        Always also emits `candidate_packs[]`, a parallel array of pack-fn
+        pointers (NULL when the candidate did not supply a `pack_weights`
+        function). Non-pack-aware harnesses ignore the array; the unused
+        attribute keeps the compiler quiet.
+        """
+        n = len(code_bodies)
+        if pack_defs is None:
+            pack_defs = [None] * n
+        if len(pack_defs) != n:
+            raise ValueError(
+                f"pack_defs length {len(pack_defs)} != code_bodies length {n}"
+            )
+
+        func_defs = []
+        pack_entries = []
+        for i, (body, pack_def) in enumerate(zip(code_bodies, pack_defs)):
+            func_defs.append(
+                f"__attribute__((noinline)) static void candidate_kernel_{i}({param_sig}) {{\n"
+                f"{body}\n"
+                f"}}"
+            )
+            if pack_def is not None:
+                # Rename pack_weights → _cand_<i>_pack_weights to keep multiple
+                # candidates from colliding on the same file-scope symbol.
+                renamed = re.sub(
+                    r'(\b)pack_weights(\b)',
+                    rf'\1_cand_{i}_pack_weights\2',
+                    pack_def,
+                )
+                func_defs.append(renamed)
+                pack_entries.append(f"_cand_{i}_pack_weights")
+            else:
+                pack_entries.append("NULL")
+
+        fn_names = [f"candidate_kernel_{i}" for i in range(n)]
+        fn_array   = f"static candidate_fn_t candidate_fns[] = {{{', '.join(fn_names)}}};"
+        id_array   = f"static int candidate_ids[] = {{{', '.join(str(idx) for idx in candidate_ids)}}};"
+        pack_array = (
+            f"static __attribute__((unused)) pack_fn_t candidate_packs[] = "
+            f"{{{', '.join(pack_entries)}}};"
+        )
+
+        try:
+            harness_text = pathlib.Path(self.test_file).read_text()
+        except Exception:
+            harness_text = ""
+        injected = _xnn_prelude(list(code_bodies) + list(pack_defs), harness_text)
+        injected += "\n".join(func_defs)
+        injected += f"\n#define NUM_CANDIDATES {n}\n"
+        injected += f"{fn_array}\n{id_array}\n{pack_array}\n"
+
+        return self.modify_test_code(injected)
+
+    def get_test_code(self, sol_code_strs: list[str], check_correct: bool=True, error_on_incorrect: bool=True, repeat_iters=None) -> str:
+        combined_sol_code_str = ""
+        for code_str in sol_code_strs:
+            code_lines = [
+                "fence();",
+                "unsigned long generated_implementation_start_cycle = read_cycles();",
+                "{",
+                code_str,
+                "}",
+                "fence();",
+                "unsigned long generated_implementation_end_cycle = read_cycles();",
+            ]
+            if check_correct:
+                code_lines.append("if (!full_is_equal(OUTPUT_MATRIX_NAME, gold)) {")
+                if error_on_incorrect:
+                    code_lines.append('printf("Incorrect result\\n");')
+                    code_lines.append('exit(1);')
+                else:
+                    code_lines.append('printf("Generated implementation latency: 99999999999 cycles\\n");')
+                code_lines.extend([
+                    "} else {",
+                    'printf("Generated implementation latency: %d cycles\\n", generated_implementation_end_cycle - generated_implementation_start_cycle);',
+                    "}",
+                ])
+            else:
+                code_lines.append('printf("Generated implementation latency: %d cycles\\n", generated_implementation_end_cycle - generated_implementation_start_cycle);')
+            for code_line in code_lines:
+                combined_sol_code_str += " "*4 + code_line + "\n"
+        
+        modified_test_code = self.modify_test_code(combined_sol_code_str)
+        lines = modified_test_code.splitlines()
+
+        for line_i, line in enumerate(lines):
+            if repeat_iters is not None:
+                if "#define REPEAT_TEST_ITERS" in line:
+                    lines[line_i] = f"#define REPEAT_TEST_ITERS {repeat_iters}"
+            if not check_correct:
+                if "#define RUN_BASELINE_CODE" in line:
+                    lines[line_i] = "#define RUN_BASELINE_CODE 0"
+
+        return "\n".join(lines)
+
+
+MAX_BUILD_SLOTS = min(8,os.cpu_count())
+
+
+def _build_and_run_spike(args: tuple) -> tuple:
+
+    code_contents, slot_id, candidate_idx, prob_type, reference_c_content = args
+    slot_dir = SATURN_TEMP_DIR / f"build_slot_{slot_id}"
+    app_dir = slot_dir / "app"
+    build_dir = slot_dir / "build"
+
+
+    try:
+        is_first = _prepare_build_slot(app_dir, build_dir, _app_path_for(prob_type))
+
+        (app_dir / "src" / "main.c").write_text(code_contents)
+        # Tier-2 reference injection: rewrite reference.c every call so the
+        # sol stays the single source of truth. _build_reference_c falls back
+        # to an empty stub when no sol exists, leaving old inline-reference
+        # harnesses unaffected.
+        (app_dir / "src" / "reference.c").write_text(
+            reference_c_content if reference_c_content else _EMPTY_REFERENCE_C
+        )
+
+        pristine_flag = "-p" if is_first else ""
+        build_cmd = f"""
+            cd {SATURN_ZEPHYR_BASE} && \
+            source scripts/set_envvars_sdk.sh && \
+            source tools/miniforge3/etc/profile.d/conda.sh && \
+            conda activate zephyr && \
+            west build {pristine_flag} -b spike_riscv64 -d {build_dir} {app_dir} -DXNNPACK_ENABLE_RISCV_VECTOR=ON -DXNNPACK_ENABLE_RISCV_GEMMINI=OFF
+        """
+        result = subprocess.run(
+            ["bash", "-c", build_cmd],
+            capture_output=True,
+            timeout=SATURN_COMPILE_TIMEOUT
+        )
+        if result.returncode != 0:
+            return (candidate_idx, f"Compile error: {result.stderr.decode()}")
+
+        binary = build_dir / "zephyr" / "zephyr.elf"
+        if not binary.exists():
+            return (candidate_idx, f"Binary not found at {binary}")
+
+    except subprocess.TimeoutExpired:
+        return (candidate_idx, "Compile timeout")
+    except Exception as e:
+        return (candidate_idx, f"Build error: {str(e)}")
+
+    # --- Run spike ---
+    try:
+        result = subprocess.run(
+            ["spike", f"--isa={SATURN_SPIKE_ISA}", str(binary)],
+            capture_output=True,
+            text=True,
+            errors="ignore",
+            timeout=SATURN_SPIKE_TIMEOUT
+        )
+        return (candidate_idx, result.stdout)
+    except subprocess.TimeoutExpired:
+        return (candidate_idx, "Timeout")
+    except Exception as e:
+        return (candidate_idx, f"Spike error: {str(e)}")
+
+
+def _run_slot(args: tuple) -> list[tuple]:
+    """Run all tasks for a single build slot sequentially."""
+    slot_id, task_list = args
+    return [_build_and_run_spike((code, slot_id, idx, prob_type, ref))
+            for code, idx, prob_type, ref in task_list]
+
+
+def run_spike_mp(code_contents_lst: list[str], prob_type: str = "",
+                 reference_c_content: str = "") -> list[str]:
+
+    results = ["Error"] * len(code_contents_lst)
+
+    num_slots = min(len(code_contents_lst), MAX_BUILD_SLOTS)
+    logger.info("Building & running spike on %d candidates across %d slots (prob_type=%s)...",
+                len(code_contents_lst), num_slots, prob_type or "<default>")
+
+    # Group tasks by slot so each slot is only accessed by one worker
+    slot_tasks: list[list[tuple]] = [[] for _ in range(num_slots)]
+    for i, code in enumerate(code_contents_lst):
+        slot_tasks[i % num_slots].append((code, i, prob_type, reference_c_content))
+
+    with multiprocessing.Pool(num_slots) as pool:
+        for slot_results in pool.imap_unordered(_run_slot, enumerate(slot_tasks)):
+            for candidate_idx, stdout in slot_results:
+                results[candidate_idx] = stdout
+
+    return results
+
+
+FIRESIM_BUILD_SLOT = 0  # Reuse spike slot 0 -- spike finishes before firesim starts
+
+def build_firesim_binary(code_contents: str, prob_type: str = "",
+                         reference_c_content: str = "") -> pathlib.Path | str:
+
+    slot_dir = SATURN_TEMP_DIR / f"build_slot_{FIRESIM_BUILD_SLOT}"
+    app_dir = slot_dir / "app"
+    build_dir = slot_dir / "build"
+
+    try:
+        is_first = _prepare_build_slot(app_dir, build_dir, _app_path_for(prob_type))
+
+        (app_dir / "src" / "main.c").write_text(code_contents)
+        (app_dir / "src" / "reference.c").write_text(
+            reference_c_content if reference_c_content else _EMPTY_REFERENCE_C
+        )
+
+        pristine_flag = "-p" if is_first else ""
+        build_cmd = f"""
+            cd {SATURN_ZEPHYR_BASE} && \
+            source scripts/set_envvars_sdk.sh && \
+            source tools/miniforge3/etc/profile.d/conda.sh && \
+            conda activate zephyr && \
+            west build {pristine_flag} -b spike_riscv64 -d {build_dir} {app_dir}
+        """
+        result = subprocess.run(
+            ["bash", "-c", build_cmd],
+            capture_output=True,
+            timeout=SATURN_COMPILE_TIMEOUT
+        )
+        if result.returncode != 0:
+            return f"Compile error: {result.stderr.decode()}"
+
+        binary = build_dir / "zephyr" / "zephyr.elf"
+        if not binary.exists():
+            return f"Compile error: binary not found at {binary}"
+
+        return binary
+
+    except subprocess.TimeoutExpired:
+        return "Compile timeout"
+    except Exception as e:
+        return f"Build error: {str(e)}"
+
+
+def _firesim_env() -> dict:
+    """Environment for `firesim` commands: this process's, minus its own Python environment (a venv
+    first on PATH would run the FireSim manager on a Python without its packages)."""
+    import sys
+    env = dict(os.environ)
+    own = {os.path.realpath(os.path.join(p, "bin")) for p in (sys.prefix, env.get("VIRTUAL_ENV")) if p}
+    env["PATH"] = os.pathsep.join(d for d in env.get("PATH", "").split(os.pathsep)
+                                  if os.path.realpath(d) not in own)
+    env.pop("VIRTUAL_ENV", None)
+    return env
+
+
+class _LocalUartlog:
+    """The live uartlog of a simulation running on this machine."""
+
+    def __init__(self, path: pathlib.Path):
+        self.path = path
+
+    def clear(self):
+        if self.path.exists():
+            self.path.write_text("")
+
+    def read(self) -> str | None:
+        return self.path.read_text() if self.path.exists() else None
+
+    def __str__(self):
+        return str(self.path)
+
+
+class _RemoteUartlog:
+    """The live uartlog of a simulation on an AWS run host, read over SSH with the FireSim key."""
+
+    def __init__(self, host: str, path: str):
+        self.host, self.path = host, path
+        self.ssh = ["ssh", "-i", SATURN_FIRESIM_SSH_KEY, "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
+                    "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", f"ubuntu@{host}"]
+
+    def _run(self, cmd: str):
+        try:
+            return subprocess.run(self.ssh + [cmd], capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def clear(self):
+        self._run(f"test -f {self.path} && : > {self.path}")
+
+    def read(self) -> str | None:
+        r = self._run(f"cat {self.path} 2>/dev/null")     # a missing log reads as empty: not started yet
+        return r.stdout if r is not None and r.returncode == 0 else None
+
+    def __str__(self):
+        return f"{self.host}:{self.path}"
+
+
+def _runtime_config(firesim_path: pathlib.Path) -> dict:
+    import yaml
+    with open(firesim_path / "deploy" / "config_runtime.yaml") as f:
+        return yaml.safe_load(f)
+
+
+def _uartlog_reader(firesim_path: pathlib.Path, infrasetup_output: str):
+    """Where to watch this simulation's uartlog. An AWS EC2 run farm (F2) runs the simulation on its own
+    instance: the uartlog is read over SSH from the run host `firesim infrasetup` just set up. Any other
+    run farm (externally provisioned localhost, e.g. Alveo U250) writes it on this machine."""
+    run_farm = _runtime_config(firesim_path)["run_farm"]
+    sim_dir = (run_farm.get("recipe_arg_overrides") or {}).get("default_simulation_dir", "/home/ubuntu")
+    slot = SATURN_FIRESIM_SIM_SLOT_DIR or pathlib.Path(sim_dir) / "sim_slot_0"
+    if "aws_ec2" not in run_farm.get("base_recipe", ""):
+        return _LocalUartlog(slot / "uartlog")
+    hosts = [h for h in dict.fromkeys(re.findall(r"\[(\d+\.\d+\.\d+\.\d+)\]", infrasetup_output))
+             if not h.startswith("127.")]
+    if len(hosts) != 1:
+        raise RuntimeError(f"expected one AWS run host in `firesim infrasetup` output, found {hosts}; "
+                           "the Saturn backend uses a single f2 instance (run_farm_hosts_to_use)")
+    return _RemoteUartlog(hosts[0], str(slot / "uartlog"))
+
+
+def run_firesim_batch(binary_path: pathlib.Path,
+                      firesim_path: pathlib.Path,
+                      n_expected: int,
+                      candidate_order: list[int] = None,
+                      per_candidate_timeout: float = SATURN_FIRESIM_PER_CANDIDATE_TIMEOUT,
+                      min_timeout: float = SATURN_FIRESIM_MIN_TIMEOUT) -> tuple[dict[int, int], str | None]:
+    """
+    Run binary on FireSim with uartlog polling for hang detection.
+
+    Monitors the live uartlog in sim_slot_0 for "ID X latency:" lines.
+    If no new result appears within per_candidate_timeout, declares a hang,
+    kills FireSim, and returns partial results collected so far.
+    """
+    # 1. Copy binary to workload directory
+    workload_dir = firesim_path / "deploy" / "workloads" / "saturn"
+    workload_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy(binary_path, workload_dir / "saturn_test-baremetal")
+
+    firesim_setup = f"cd {firesim_path} && source {firesim_path}/sourceme-manager.sh"
+    fs_env = _firesim_env()
+
+    # 2. Run infrasetup (blocking)
+    logger.info("Running `firesim infrasetup`")
+    infrasetup = subprocess.run(
+        ["bash", "-c", f"{firesim_setup} && firesim infrasetup"],
+        capture_output=True, text=True, env=fs_env
+    )
+    if infrasetup.returncode != 0:
+        logger.error("firesim infrasetup failed: %s", infrasetup.stderr or infrasetup.stdout)
+        raise RuntimeError(f"firesim infrasetup failed with return code {infrasetup.returncode}")
+
+    # 3. Clear old uartlog so we only see fresh output. The run host is in infrasetup's output and in
+    #    FireSim's log of it (deploy/logs/*-infrasetup-*.log).
+    logs = sorted((firesim_path / "deploy" / "logs").glob("*-infrasetup-*.log"), key=os.path.getmtime)
+    uartlog = _uartlog_reader(firesim_path, (infrasetup.stdout or "") + (infrasetup.stderr or "")
+                              + (logs[-1].read_text(errors="replace") if logs else ""))
+    logger.info("FireSim: watching uartlog at %s", uartlog)
+    uartlog.clear()
+
+    # 4. Launch runworkload in background
+    logger.info("Running `firesim runworkload` (polling uartlog for results)")
+    firesim_start = time.time()
+    # runworkload redraws a status page every few seconds; send it to a log file rather than an unread
+    # pipe, which would fill and block runworkload during a long batch.
+    runworkload_log = open(firesim_path / "deploy" / "logs" / "autocomp-runworkload.log", "a")
+    proc = subprocess.Popen(
+        ["bash", "-c", f"{firesim_setup} && firesim runworkload"],
+        stdout=runworkload_log, stderr=subprocess.STDOUT, env=fs_env
+    )
+
+    # 5. Poll uartlog for results — both latency and (optional) score lines.
+    pattern = re.compile(r"ID (\d+) latency: (\d+) cycles")
+    # Require the trailing " (" so we only match COMPLETE score lines.
+    # Without a sentinel, finditer captures partial digits from a printf
+    # that's mid-flush in the uartlog (saw "ID 4 score: 140" when the real
+    # value being printed was 140258 — first-match-wins then locked in
+    # the truncated number).
+    score_pattern = re.compile(r"ID (\d+) score: (\d+) \(")
+    results = {}
+    scores = {}
+    last_result_time = time.time()
+    poll_interval = 1.0
+    hung_candidate = None
+    content = ""
+    if isinstance(uartlog, _RemoteUartlog):
+        poll_interval = 5.0       # one SSH round trip per poll
+
+    try:
+        while len(results) < n_expected:
+            # Check if process exited
+            if proc.poll() is not None:
+                # Process finished — parse final uartlog
+                final_text = uartlog.read()
+                if final_text is not None:
+                    for m in pattern.finditer(final_text):
+                        results[int(m.group(1))] = int(m.group(2))
+                    for m in score_pattern.finditer(final_text):
+                        scores[int(m.group(1))] = int(m.group(2))
+                break
+
+            # Read current uartlog
+            text = uartlog.read()
+            if text is not None:
+                content = text
+                new_found = False
+                for m in pattern.finditer(content):
+                    idx, latency = int(m.group(1)), int(m.group(2))
+                    if idx not in results:
+                        results[idx] = latency
+                        logger.info("FireSim: candidate %d = %d cycles", idx, latency)
+                        new_found = True
+                # Always overwrite — see score_pattern comment above. The regex
+                # already gates on a complete line, but if the firesim
+                # restarts or anything ever emits two score lines for the
+                # same ID, the later one is what we want.
+                for m in score_pattern.finditer(content):
+                    idx, score = int(m.group(1)), int(m.group(2))
+                    scores[idx] = score
+                if new_found:
+                    last_result_time = time.time()
+
+            # Check for hang — kill if no new result in per_candidate_timeout
+            # First candidate gets extra time for runworkload setup
+            hang_timeout = per_candidate_timeout + (15 if not results else 0)
+            elapsed = time.time() - last_result_time
+            if elapsed > hang_timeout:
+                hung_candidate = _identify_hung_candidate(content, results, candidate_order)
+                logger.warning("FireSim: no new result for %.0fs, candidate %s appears to hang",
+                               elapsed, hung_candidate)
+                break
+
+            time.sleep(poll_interval)
+
+    finally:
+        # Kill FireSim if still running. If `firesim kill` doesn't actually bring
+        # down runworkload within the wait window we MUST NOT raise — partial
+        # results have to make it back to the caller (the hang has already been
+        # logged; an uncaught TimeoutExpired here aborts the entire search run).
+        if proc.poll() is None:
+            logger.info("Killing FireSim (poll exit)")
+            kill_cmd = f"{firesim_setup} && firesim kill"
+            try:
+                subprocess.run(["bash", "-c", kill_cmd],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               timeout=180, env=fs_env)
+            except subprocess.TimeoutExpired:
+                logger.warning("FireSim: `firesim kill` itself hung; proceeding to SIGKILL")
+            try:
+                proc.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                logger.warning("FireSim: runworkload did not exit 120s after kill; SIGKILLing")
+                proc.kill()
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    logger.error("FireSim: runworkload survived SIGKILL+wait — leaking process")
+        runworkload_log.close()
+
+    # Final uartlog sweep: the poll loop exits the moment `results` reaches
+    # n_expected, but the harness prints "latency", then "instret", then
+    # "score" in that order — score may not have flushed at the moment we
+    # detected latency, so we'd miss it. By the time we get here, firesim
+    # is killed and the uartlog is at its final state, so any score lines
+    # for already-timed candidates are guaranteed to be present.
+    final_text = uartlog.read()
+    if final_text is not None:
+        for m in score_pattern.finditer(final_text):
+            idx, score = int(m.group(1)), int(m.group(2))
+            if idx not in scores and idx in results:
+                scores[idx] = score
+
+    firesim_wall = time.time() - firesim_start
+    if hung_candidate is not None:
+        logger.warning("FireSim: hung on candidate %s, returning %d partial results (%.1fs wall)",
+                       hung_candidate, len(results), firesim_wall)
+    else:
+        logger.info("FireSim: collected %d/%d results (%.1fs wall, %d scores)",
+                    len(results), n_expected, firesim_wall, len(scores))
+
+    return results, scores, hung_candidate
+
+
+def _identify_hung_candidate(uartlog_content: str, results: dict[int, int],
+                             candidate_order: list[int] = None) -> str:
+    """Try to identify which candidate hung based on uartlog content and run order."""
+    if candidate_order:
+        for idx in candidate_order:
+            if idx not in results:
+                return str(idx)
+    if not results:
+        return "unknown (no results before hang)"
+    last_id = max(results.keys())
+    return str(last_id + 1)
+
+
+def parse_firesim_uartlog(log_path: str) -> dict[int, int]:
+    """
+    Parse FireSim uartlog to extract latencies per candidate.
+
+    Expected format: "ID <orig_idx> latency: <cycles> cycles"
+    """
+    results = {}
+    log_content = pathlib.Path(log_path).read_text()
+
+    # Pattern: "ID 5 latency: 12345 cycles"
+    pattern = r"ID (\d+) latency: (\d+) cycles"
+    matches = re.findall(pattern, log_content)
+
+    for orig_idx_str, latency_str in matches:
+        orig_idx = int(orig_idx_str)
+        latency = int(latency_str)
+        results[orig_idx] = latency
+        logger.debug("Parsed FireSim result: candidate %d = %d cycles", orig_idx, latency)
+
+    return results
+
+
+class SaturnEvalBackend(EvalBackend):
+    """
+    Hardware backend for evaluating RVV code on Saturn core using spike/FireSim.
+
+    """
+
+    def __init__(self,
+                 vlen: int = 256,
+                 elen: int = 64,
+                 chipyard_path: str = None):
+
+        super().__init__()
+        self.vlen = vlen
+        self.elen = elen
+
+        # Set paths
+        chipyard_path = chipyard_path or SATURN_CHIPYARD_PATH
+        if chipyard_path:
+            self.chipyard_path = pathlib.Path(chipyard_path).resolve()
+            self.saturn_path = self.chipyard_path / "generators" / "firechip"
+            self.firesim_path = self.chipyard_path / "sims" / "firesim"
+        else:
+            self.chipyard_path = None
+            self.saturn_path = None
+            self.firesim_path = None
+
+    def __repr__(self):
+        return f"SaturnEvalBackend(vlen={self.vlen}, elen={self.elen})"
+
+    def evaluate_code_spike(self, prob: Prob, code_strs: list[str]) -> List[dict]:
+        """Convenience method for spike-only evaluation."""
+        return self.evaluate_code(prob, code_strs, "spike")
+
+    def evaluate_code_firesim(self, prob: Prob, code_strs: list[str]) -> List[dict]:
+        """Convenience method for FireSim evaluation."""
+        return self.evaluate_code(prob, code_strs, "firesim")
+
+    def evaluate_code(self, prob, code_strs: list[str], simulator: str) -> List[dict]:
+        """
+        Evaluate code candidates and return results.
+
+        """
+        # Wrap tests with SaturnTest for customizable test behavior
+        saturn_tests = [SaturnTest(t.test_file) for t in prob.tests]
+
+        if not self.saturn_path or not self.saturn_path.exists():
+            raise ValueError(
+                "Saturn path not configured. Set SATURN_CHIPYARD_PATH environment variable "
+                "or pass chipyard_path to constructor."
+            )
+
+        # Initialize results - all passing at the beginning (flip to False on test failure)
+        stats = [{
+            "correct": True,
+            "test_results": {}
+        } for _ in code_strs]
+
+        # Clean code strings (remove wrapper functions) + extract any optional
+        # `pack_weights` definitions (parallel list, None where absent).
+        clean_code_strs = [clean_code(code_str)        for code_str in code_strs]
+        pack_defs_strs  = [_extract_pack_weights(code_str) for code_str in code_strs]
+        # Run each test
+        for test_i, test in enumerate(saturn_tests):
+            logger.info("Running spike on %d code candidates for test %d", len(code_strs), test_i)
+
+            # Get test code with each candidate injected. New xnnpack-style
+            # harnesses (with candidate_fn_t typedef) get inject_candidates;
+            # legacy inline-SUBSTITUTE-HERE harnesses stay on get_test_code.
+            if test.uses_candidate_fn_style():
+                param_sig = self._extract_param_sig(prob)
+                test_codes = [
+                    test.inject_candidates(
+                        [clean_code_strs[i]], [0], param_sig,
+                        pack_defs=[pack_defs_strs[i]],
+                    )
+                    for i in range(len(clean_code_strs))
+                ]
+            else:
+                test_codes = [test.get_test_code([code_str]) for code_str in clean_code_strs]
+
+            # Run spike in parallel; precompute reference.c once per prob.
+            ref_c = _build_reference_c(prob)
+            test_output_per_code_str = run_spike_mp(
+                test_codes, prob_type=prob.prob_type, reference_c_content=ref_c,
+            )
+
+            # Parse results
+            for code_i, test_output in enumerate(test_output_per_code_str):
+                if "Correct" in test_output:
+                    logger.debug("Code %d, Test %d: Correct result", code_i, test_i)
+                    stats[code_i]["test_results"][test_i] = True
+
+                    # Extract metrics from spike output ONLY when running in
+                    # spike mode. In firesim mode the spike pass is a
+                    # correctness check; firesim's cycle counts (and score)
+                    # are the optimization reference and get populated later
+                    # from the firesim uartlog. If we backfilled spike's score
+                    # here, firesim runs would silently fall back to
+                    # spike-cycle geomean whenever the uartlog parse missed.
+                    if simulator == "spike":
+                        if "Generated implementation latency" in test_output:
+                            try:
+                                latency_str = test_output.split("Generated implementation latency: ")[-1]
+                                stats[code_i]["latency"] = int(latency_str.split(" cycles")[0])
+                            except (ValueError, IndexError):
+                                logger.warning("Failed to parse latency from spike output for code %d", code_i)
+                        if "Generated implementation score" in test_output:
+                            try:
+                                score_str = test_output.split("Generated implementation score: ")[-1]
+                                stats[code_i]["score"] = int(score_str.split("\n")[0].strip())
+                            except (ValueError, IndexError):
+                                logger.warning("Failed to parse score from spike output for code %d", code_i)
+                else:
+                    logger.debug("Code %d, Test %d: Incorrect result", code_i, test_i)
+                    stats[code_i]["test_results"][test_i] = False
+                    stats[code_i]["correct"] = False
+                    stats[code_i]["stderr"] = test_output
+
+                    # Log specific error type
+                    if test_output == "Compile error":
+                        logger.debug("Code %d: Compilation failed", code_i)
+                    elif test_output == "Timeout":
+                        logger.debug("Code %d: Spike timeout", code_i)
+
+        # FireSim evaluation - run passing candidates on FireSim for accurate latency
+        if simulator == "firesim":
+            if not self.firesim_path or not self.firesim_path.exists():
+                msg = "FireSim path not configured"
+                logger.warning(msg)
+                for s in stats:
+                    if s["correct"]:
+                        s["correct"] = False
+                        s["stderr"] = msg
+            else:
+                passing_indices = [i for i, s in enumerate(stats) if s["correct"]]
+                passing_codes     = [clean_code_strs[i] for i in passing_indices]
+                passing_pack_defs = [pack_defs_strs[i]  for i in passing_indices]
+
+                if not passing_codes:
+                    logger.info("No passing candidates to run on FireSim.")
+                else:
+                    logger.info("Running %d passing candidates on FireSim...", len(passing_codes))
+
+                    firesim_latencies, firesim_scores = self._run_firesim_batch(
+                        passing_codes, passing_indices, prob,
+                        pack_defs=passing_pack_defs,
+                    )
+
+                    # Update stats with FireSim latencies + scores. Score
+                    # populated from spike correctness pass earlier is now
+                    # overwritten with firesim's value when present (real
+                    # firesim-cycle geomean rather than spike's).
+                    for orig_idx, latency in firesim_latencies.items():
+                        if latency is not None:
+                            stats[orig_idx]["firesim_latency"] = latency
+                            stats[orig_idx]["latency"] = latency
+                            logger.debug("FireSim latency for candidate %d: %d cycles", orig_idx, latency)
+                    for orig_idx, score in firesim_scores.items():
+                        if score is not None:
+                            stats[orig_idx]["score"] = score
+                    missing_indices = set(passing_indices) - set(firesim_latencies.keys())
+                    if missing_indices:
+                        msg = "FireSim did not return latency for candidate"
+                        for orig_idx in missing_indices:
+                            stats[orig_idx]["correct"] = False
+                            stats[orig_idx]["stderr"] = msg
+
+        logger.debug("Evaluation stats: %s", stats)
+        return stats
+
+    def _run_firesim_batch(self,
+                           passing_codes: list[str],
+                           passing_indices: list[int],
+                           prob: Prob,
+                           pack_defs: list = None) -> dict[int, int]:
+        """
+        Run passing candidates on FireSim with uartlog polling.
+
+        Monitors the live uartlog for results. If a candidate hangs,
+        kills FireSim, removes the hanging candidate, and re-runs
+        the remaining untimed candidates. Repeats until all candidates
+        are timed or all remaining ones hang.
+        """
+        saturn_tests = [SaturnTest(t.test_file) for t in prob.tests]
+        if not saturn_tests:
+            raise ValueError("No tests available for FireSim template")
+        first_test = saturn_tests[0]
+
+        all_results = {}
+        all_scores = {}
+        remaining_codes     = list(passing_codes)
+        remaining_indices   = list(passing_indices)
+        remaining_pack_defs = list(pack_defs) if pack_defs is not None else [None] * len(passing_codes)
+        hung_indices = set()
+
+        uses_fn_style = first_test.uses_candidate_fn_style()
+        param_sig = self._extract_param_sig(prob) if uses_fn_style else None
+
+        while remaining_indices:
+            if uses_fn_style:
+                combined_code = first_test.inject_candidates(
+                    remaining_codes, remaining_indices, param_sig,
+                    pack_defs=remaining_pack_defs,
+                )
+            else:
+                combined_code = self._build_firesim_combined_code(
+                    remaining_codes, remaining_indices, first_test, prob
+                )
+            binary_result = build_firesim_binary(
+                combined_code, prob_type=prob.prob_type,
+                reference_c_content=_build_reference_c(prob),
+            )
+            if isinstance(binary_result, str):
+                raise RuntimeError(f"Failed to compile FireSim binary: {binary_result}")
+
+            results, scores, hung_candidate = run_firesim_batch(
+                binary_result, self.firesim_path,
+                n_expected=len(remaining_indices),
+                candidate_order=remaining_indices
+            )
+
+            # Collect successful results
+            all_results.update(results)
+            all_scores.update(scores)
+
+            if hung_candidate is None:
+                break
+
+            try:
+                hung_idx = int(hung_candidate)
+            except (ValueError, TypeError):
+                logger.warning("Could not identify hung candidate (%s), stopping retries", hung_candidate)
+                break
+
+            hung_indices.add(hung_idx)
+            logger.info("Removing hung candidate %d, re-running %d remaining",
+                        hung_idx, len(remaining_indices) - len(results) - 1)
+
+            # Rebuild remaining list: exclude already-timed and hung candidates
+            timed_or_hung = set(all_results.keys()) | hung_indices
+            new_codes      = []
+            new_indices    = []
+            new_pack_defs  = []
+            orig_pack_defs = pack_defs if pack_defs is not None else [None] * len(passing_codes)
+            for code, idx, pdef in zip(passing_codes, passing_indices, orig_pack_defs):
+                if idx not in timed_or_hung:
+                    new_codes.append(code)
+                    new_indices.append(idx)
+                    new_pack_defs.append(pdef)
+
+            remaining_codes     = new_codes
+            remaining_indices   = new_indices
+            remaining_pack_defs = new_pack_defs
+
+            if not remaining_indices:
+                logger.info("No more candidates to re-run after removing hung ones")
+
+        return all_results, all_scores
+
+    def _extract_param_sig(self, prob) -> str:
+        """Read the sol file for `prob` and return its function parameter
+        signature as a single comma-separated string (e.g. "const float *a, int b"),
+        or "void" if no parameters."""
+        sol_dir = SOLS_DIR / prob.prob_type
+        sol_files = list(sol_dir.glob(f"{prob.prob_id}_*.c"))
+        if not sol_files:
+            return "void"
+        params = self._extract_candidate_params(sol_files[0].read_text())
+        if not params:
+            return "void"
+        return ", ".join(f"{t} {n}" for t, n in params)
+
+    @staticmethod
+    def _extract_candidate_params(code_str: str) -> list[tuple[str, str]]:
+        """
+        Extract function parameters from the first function definition in a
+        solution file. Works with any function name (void test, void xnn_f32_..., etc).
+
+        Returns list of (type, name) tuples. Empty if no function definition found
+        (e.g. gemm tests where candidates access globals directly).
+        """
+        # Strip C/C++ comments first — sol files now embed PyTorch source as a
+        # comment block, and the prior regex was picking up `def __init__(` or
+        # `class Model(` from those comments instead of the C function below.
+        code_str = re.sub(r'/\*.*?\*/', '', code_str, flags=re.DOTALL)
+        code_str = re.sub(r'//[^\n]*', '', code_str)
+
+        # Find the first kernel-shaped function definition, SKIPPING
+        # `pack_weights` (a generic-signature companion fn whose params would
+        # otherwise pollute the kernel param_sig).
+        match = None
+        for name, fstart, _bo, _bc in _find_function_spans(code_str):
+            if name == 'pack_weights':
+                continue
+            match = re.match(r'\b\w[\w\s*]*\s+(\w+)\s*\([^)]*\)[^{;]*\{',
+                             code_str[fstart:], re.DOTALL)
+            if match:
+                code_str = code_str[fstart:]
+            break
+        if not match:
+            return []
+
+        # Find the opening paren position
+        paren_start = code_str.index('(', match.start())
+        after_paren = code_str[paren_start + 1:]
+
+        # Find matching closing paren (handle nested parens)
+        paren_depth = 1
+        param_end = 0
+        for j, ch in enumerate(after_paren):
+            if ch == '(':
+                paren_depth += 1
+            elif ch == ')':
+                paren_depth -= 1
+                if paren_depth == 0:
+                    param_end = j
+                    break
+        param_str = after_paren[:param_end]
+
+        # Parse comma-separated parameters
+        params = []
+        for param in param_str.split(','):
+            param = ' '.join(param.split())  # normalize whitespace
+            if not param:
+                continue
+            parts = param.rsplit(None, 1)
+            if len(parts) == 2:
+                var_type, var_name = parts
+                if var_name.startswith('*'):
+                    var_type += ' *'
+                    var_name = var_name[1:]
+                params.append((var_type, var_name))
+
+        return params
+
+    def _build_firesim_combined_code(self,
+                                      passing_codes: list[str],
+                                      passing_indices: list[int],
+                                      test,
+                                      prob: Prob = None) -> str:
+        """
+        Build combined C code with all passing candidates for FireSim batching.
+
+        Each candidate is wrapped in its own noinline function to isolate
+        vector register allocation (prevents register pressure from LMUL=8
+        candidates causing spills/crashes in a single giant function).
+
+        The function signature is derived from the solution file in sols/.
+        """
+        # Read the solution file to extract function parameters
+        params = []
+        if prob:
+            sol_dir = SOLS_DIR / prob.prob_type
+            sol_files = list(sol_dir.glob(f"{prob.prob_id}_*.c"))
+            if sol_files:
+                sol_content = sol_files[0].read_text()
+                params = self._extract_candidate_params(sol_content)
+
+        if params:
+            param_sig = ", ".join(f"{t} {n}" for t, n in params)
+            param_args = ", ".join(n for _, n in params)
+        else:
+            param_sig = "void"
+            param_args = ""
+
+        # Generate noinline wrapper functions for each candidate
+        func_defs = []
+        for code, orig_idx in zip(passing_codes, passing_indices):
+            func_defs.append(f"""
+__attribute__((noinline)) void run_candidate_{orig_idx}({param_sig}) {{
+{code}
+}}
+""")
+
+        func_defs_str = "\n".join(func_defs)
+
+        # Generate call blocks in main
+        code_blocks = []
+        for code, orig_idx in zip(passing_codes, passing_indices):
+            code_blocks.append(f"""
+    // Run candidate {orig_idx}
+    RESET_STATE();
+    fence();
+    __asm__ volatile("vsetvli x0, x0, e8, m1, ta, ma");
+    start_cycle = read_cycles();
+    run_candidate_{orig_idx}({param_args});
+    fence();
+    __asm__ volatile("vsetvli x0, x0, e8, m1, ta, ma");
+    end_cycle = read_cycles();
+    printf("ID {orig_idx} latency: %lu cycles\\n", end_cycle - start_cycle);
+""")
+
+        code_blocks_str = "\n".join(code_blocks)
+
+        # Build the substitution block
+        substitution = f"""
+    unsigned long start_cycle, end_cycle;
+
+{code_blocks_str}
+"""
+
+        # Use the test's modify_test_code to inject our combined code,
+        # then prepend the noinline function definitions before main()
+        combined = test.modify_test_code(substitution)
+
+        # Insert function definitions before main()
+        main_pos = combined.find("\nint main(")
+        if main_pos == -1:
+            main_pos = combined.find("\nint main ")
+        if main_pos != -1:
+            combined = combined[:main_pos] + "\n" + func_defs_str + combined[main_pos:]
+        else:
+            # Fallback: prepend after includes
+            combined = func_defs_str + "\n" + combined
+
+        return combined
+
+
+if __name__ == "__main__":
+    prob = Prob("rvv-qs8", 0)
+    files = [SOLS_DIR / "rvv-qs8" / "qs8-vaddc.c"]
+    if files[0].exists():
+        code_str = files[0].read_text()
+        code_strs = [code_str, code_str, code_str]
+        backend = SaturnEvalBackend()
+        stats = backend.evaluate_code(prob, code_strs, "firesim")
+        for i, stat in enumerate(stats):
+            print(f"  Candidate {i}: {stat}")
+    else:
+        print("No test files found. Create tests in harnesses/rvv-qs8/ and sols in sols/rvv-qs8/")

@@ -1,0 +1,181 @@
+strategies:
+- strategy: >-
+    Translate PyTorch tensor code or exported PyTorch model graphs into C/C++ kernels written with
+    RISC-V Vector Extension intrinsics from `riscv_vector.h`. Treat the source as high-level tensor
+    semantics, not as fixed-width SIMD, NEON, SSE, AVX, or scalar-to-vector code.
+- strategy: >-
+    Prefer lowering from a normalized graph representation produced by `torch.export` or
+    `torch.onnx.export(..., dynamo=True)`. Accept FX graphs, ONNX graphs, or legacy TorchScript only
+    as input/fallback forms. Preserve operator order, tensor metadata, constants, parameters,
+    buffers, and module mode (`eval` vs `train`) before selecting RISC-V Vector intrinsic sequences.
+- strategy: >-
+    For benchmark-style PyTorch workloads, classify the problem before lowering. Treat single-operator
+    kernels, simple fusion chains, and larger model blocks differently, because each level has a
+    different best granularity for RISC-V Vector intrinsic generation.
+- strategy: >-
+    Specialize generated intrinsic kernels for static benchmark shapes when they are known. Emit
+    host-side shape guards that call the specialized path and keep a correct generic fallback for
+    dynamic or unexpected shapes.
+- strategy: >-
+    Do not carry over GPU execution assumptions from CUDA or Triton solutions. RISC-V
+    Vector intrinsic code has no warps, thread blocks, shared memory, or tensor cores; map the work
+    to cache-aware CPU loops with `__riscv_vsetvl_*` stripmining.
+- strategy: >-
+    Use a roofline-style triage before choosing the kernel structure. For pointwise and fusion
+    workloads, reduce memory traffic and avoid intermediate tensors. For matmul, convolution, and
+    attention-like workloads, prioritize cache blocking, data reuse, and the accumulator dtype.
+- strategy: >-
+    Fuse simple benchmark-style operator chains aggressively when safe, such as `matmul + bias +
+    activation`, `conv + bias + relu`, normalization plus affine parameters, and pointwise chains.
+    Do not fuse across reductions, RNG, mutation, aliasing, layout materialization, or dtype/rounding
+    boundaries unless correctness tests prove equivalence.
+- strategy: >-
+    Preserve the benchmark-facing Python or model API wrapper. Lower only the hot tensor region into
+    native RISC-V Vector intrinsic code, and keep argument setup, output allocation, guards, and
+    fallback dispatch compatible with the benchmark harness.
+- strategy: >-
+    Minimize packing, transposes, and temporary buffers. Only introduce layout conversion when reuse
+    across inner loops, repeated calls, or large K reductions clearly repays the extra memory traffic.
+- strategy: >-
+    Generate a correctness-first intrinsic kernel before optimizing. Benchmark-style scoring often
+    filters on correctness before speedup, so the first version should be simple, reference-faithful,
+    and easy to compare against PyTorch.
+- strategy: >-
+    Validate with benchmark-aware tests: representative random inputs, edge values, supported dtypes,
+    non-contiguous inputs when the harness allows them, PyTorch-appropriate tolerances, warmup runs,
+    repeated timing, and checks that the kernel does not skip work or reuse stale outputs.
+- strategy: >-
+    Add separate small-tensor paths when overhead dominates. For tiny workloads, scalar code or a
+    lightly vectorized loop can beat an elaborate tiled RISC-V Vector intrinsic kernel because call
+    overhead, branching, and `vsetvl` setup may dominate total runtime.
+- strategy: >-
+    Identify the computation boundary first. Keep Python orchestration, shape checks, allocation,
+    and unsupported control flow in host code; lower pure tensor operations and hot operator regions
+    into RISC-V Vector intrinsic kernels.
+- strategy: >-
+    Preserve PyTorch tensor metadata exactly: dtype, shape, strides, storage offset, memory format,
+    aliasing, and whether an operation is in-place or out-of-place. A `view`, `reshape`, `permute`,
+    `transpose`, `squeeze`, or `unsqueeze` is metadata-only unless PyTorch would materialize a
+    contiguous copy.
+- strategy: >-
+    Generate a fast path for contiguous tensors and a correct generic path for strided or
+    nonzero-storage-offset tensors. Use unit-stride intrinsic loads/stores such as
+    `__riscv_vle32_v_f32m1` and `__riscv_vse32_v_f32m1` for contiguous inner dimensions, and strided
+    intrinsic loads/stores such as `__riscv_vlse32_v_f32m1` and `__riscv_vsse32_v_f32m1` or scalar
+    address generation for non-contiguous layouts.
+- strategy: >-
+    Use `__riscv_vsetvl_*` stripmine loops, such as `__riscv_vsetvl_e32m1(remaining)`, for every
+    vectorized tensor dimension. Do not assume a fixed vector width or hard-code the number of
+    elements per vector; the final iteration is handled by the smaller `vl`.
+- strategy: >-
+    Choose the vectorized dimension from tensor layout. Prefer the innermost contiguous dimension for
+    NCHW/row-major tensors, the channel dimension for channels-last layouts when it is contiguous,
+    and the output-feature/channel dimension for dense layer and convolution kernels.
+- strategy: >-
+    Implement PyTorch broadcasting by mapping broadcasted dimensions to stride 0. Use RISC-V Vector
+    scalar operand intrinsic forms for true scalar operands and vector loads for expanded tensor
+    operands. Use `_vf` for floating-point vector-scalar operations and `_vx` for integer
+    vector-scalar operations; RVV intrinsics do not expose a `_vi` form — the compiler emits the
+    `.vi` assembly encoding automatically when a small compile-time constant is passed to the `_vx`
+    intrinsic.
+- strategy: >-
+    Preserve PyTorch dtype promotion rules. Compute the result dtype before lowering the operator,
+    including mixed integer/float inputs, scalar literals, boolean tensors, and explicit
+    `to()`/`type_as()` casts.
+- strategy: >-
+    Match PyTorch casting behavior for each dtype conversion. Implement rounding mode, saturation,
+    NaN, infinity, signedness, and overflow behavior according to the relevant ATen reference behavior
+    or generated correctness tests; do not infer it from RISC-V Vector intrinsic defaults.
+- strategy: >-
+    Lower pointwise unary and binary ops (`add`, `sub`, `mul`, `div`, `neg`, `abs`, `relu`,
+    `sigmoid`, `tanh`, `gelu`, clamps, comparisons) as stripmined loops over the logical tensor
+    iteration space using explicit intrinsics such as `__riscv_vfadd_vv_f32m1`,
+    `__riscv_vfmul_vf_f32m1`, or the dtype-appropriate integer equivalents.
+- strategy: >-
+    Fuse adjacent pointwise operations when it does not change PyTorch-visible behavior, dtype
+    promotion, rounding, NaN handling, aliasing, or exception behavior. Common useful fusions include
+    bias-add plus activation, clamp patterns, residual add plus activation, and affine normalization
+    epilogues.
+- strategy: >-
+    Translate PyTorch comparisons and `torch.where` into RISC-V Vector mask types such as `vbool32_t`
+    and merge or masked intrinsic forms such as `__riscv_vmerge_vvm_*` or `_m` operations. Derive
+    the mask type from the data vector's SEW/LMUL ratio; for example, `e32m1` uses `vbool32_t`,
+    `e32m2` uses `vbool16_t`, and `e16m1` uses `vbool16_t`. If a boolean tensor is materialized,
+    store PyTorch-compatible boolean values rather than mask registers.
+- strategy: >-
+    Preserve in-place semantics for ops ending in `_` and for `out=` arguments. Handle overlapping
+    input/output storage conservatively; use a temporary or a direction-safe loop when writing in
+    place could overwrite values that are still needed.
+- strategy: >-
+    Implement reductions (`sum`, `prod`, `max`, `min`, `mean`, `argmax`, `argmin`, `norm`) over the
+    requested dimensions with correct `keepdim` behavior, identity values, empty-tensor behavior,
+    index tie-breaking, NaN behavior, and accumulation dtype.
+- strategy: >-
+    For floating-point reductions, use RISC-V Vector reduction intrinsics such as `__riscv_vfredusum_*`
+    or `__riscv_vfredosum_*` only when their ordering and numerical behavior are acceptable for the
+    PyTorch operator and target tolerance. Use explicit tree or scalar cleanup logic when deterministic
+    or reference-compatible accumulation order is required.
+- strategy: >-
+    Lower `softmax` and `log_softmax` with the numerically stable max-subtract-exp-sum pattern along
+    the requested dimension. Vectorize the elementwise passes and reductions, and use an approved
+    exp/log implementation with accuracy compatible with PyTorch tests.
+- strategy: >-
+    Lower `layer_norm`, `batch_norm`, `group_norm`, and `rms_norm` by preserving PyTorch's epsilon
+    placement, reduction axes, affine parameters, training/eval mode, and accumulation dtype. In eval
+    mode, fold constant batch-norm scale and bias into a preceding conv or linear op when safe.
+- strategy: >-
+    Lower `nn.Linear`, `matmul`, `mm`, `bmm`, and attention projection matrices as blocked kernels.
+    Use RISC-V Vector fused multiply-add intrinsics such as `__riscv_vfmacc_vv_*` or
+    `__riscv_vfmacc_vf_*` for mathematically fused dot-product accumulation only when it matches the
+    chosen PyTorch/ATen numerical contract and test tolerance.
+- strategy: >-
+    For matrix multiplication, block M/N/K for cache reuse and vectorize across contiguous N columns
+    or output features when possible. Accumulate in the PyTorch-specified accumulation dtype such as
+    fp32 for fp16/bf16 paths when required.
+- strategy: >-
+    Lower `conv1d`, `conv2d`, and `conv3d` using direct, tiled, im2col, or specialized kernels based
+    on shape. Preserve stride, padding, dilation, groups, depthwise behavior, bias addition, and
+    memory format; avoid materializing large im2col buffers unless it is clearly beneficial.
+- strategy: >-
+    For pooling ops, preserve kernel size, stride, padding, dilation, ceil mode, count-include-pad,
+    divisor override, indices, and NaN behavior. Vectorize contiguous windows where possible and fall
+    back to scalar boundary handling for irregular edges.
+- strategy: >-
+    Translate embedding, gather, scatter, index_select, and advanced indexing with PyTorch's index
+    dtype, bounds, duplicate-index, and accumulation semantics. Vectorize contiguous payload copies
+    or reductions, but keep irregular index traversal explicit and correct.
+- strategy: >-
+    Handle quantized or int8 model code by preserving scale, zero point, per-tensor vs per-channel
+    parameters, signedness, rounding, clamping, and accumulator width. Use RISC-V Vector widening
+    multiply/add intrinsics and explicit narrowing/saturation intrinsics only after the quantization
+    math is complete.
+- strategy: >-
+    Preserve model parameters and buffers as immutable inputs unless the PyTorch code mutates them.
+    Treat dropout, batch norm, running statistics, RNG, and training-only behavior according to the
+    module's current mode.
+- strategy: >-
+    Translate tensor copies, `contiguous()`, `clone()`, padding, slicing, and layout conversions as
+    data-movement kernels only when PyTorch would materialize data. Use RISC-V Vector unit-stride,
+    strided, segmented, or indexed load/store intrinsics based on the source and destination strides.
+- strategy: >-
+    For shape-dependent control flow, emit host-side branches that select among specialized
+    RISC-V Vector intrinsic kernels or a generic fallback. Do not bake dynamic dimensions into the
+    generated kernel unless the model export declares them static.
+- strategy: >-
+    Use tail-agnostic and mask-agnostic RISC-V Vector intrinsic policy forms by default. Use
+    undisturbed variants (`_tu`, `_mu`, `_tum`, `_tumu`) only when masked-off or tail elements are
+    later read as part of PyTorch-visible behavior.
+- strategy: >-
+    Prefer explicit, non-overloaded RISC-V Vector intrinsics in generated kernels. Emit full
+    `__riscv_*` spellings with type and LMUL suffixes so dtype, SEW, LMUL, mask type, and
+    accumulation choices are auditable.
+- strategy: >-
+    Validate every lowered operator or fused region against PyTorch reference execution using
+    representative shapes, dtypes, layouts, broadcasting cases, edge values, and dynamic-shape cases
+    when applicable. Use PyTorch-appropriate tolerances for floating-point outputs and exact checks
+    for integer, boolean, and index outputs.
+- strategy: >-
+    When an operator is unsupported or its PyTorch semantics are unclear, emit a clear fallback to the
+    reference implementation or leave the region untranslated. Do not approximate a PyTorch op with
+    a RISC-V Vector intrinsic sequence unless the semantic differences are documented and accepted by
+    tests.
